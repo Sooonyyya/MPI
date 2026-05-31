@@ -39,6 +39,7 @@ unordered_map<string, int> countWordsInFile(const string& filename)
 
     if (!file.is_open())
     {
+#pragma omp critical
         cerr << "[ERROR] Cannot open file: " << filename << endl;
         return frequencies;
     }
@@ -112,16 +113,35 @@ unordered_map<string, int> openMpWordCount(const vector<string>& files, int thre
 #pragma omp single
         {
             actualThreads = omp_get_num_threads();
-            localMaps.resize(actualThreads);
+            if (actualThreads > 0)
+            {
+                localMaps.resize(actualThreads);
+            }
+            else
+            {
+#pragma omp critical
+                cerr << "[ERROR] OpenMP: 0 actual threads." << endl;
+            }
         }
 
-        int threadId = omp_get_thread_num();
-
-#pragma omp for schedule(dynamic)
-        for (int i = 0; i < (int)files.size(); i++)
+        if (actualThreads > 0)
         {
-            auto fileFrequencies = countWordsInFile(files[i]);
-            mergeMaps(localMaps[threadId], fileFrequencies);
+            int threadId = omp_get_thread_num();
+
+            if (threadId >= 0 && threadId < actualThreads)
+            {
+#pragma omp for schedule(dynamic)
+                for (int i = 0; i < (int)files.size(); i++)
+                {
+                    auto fileFrequencies = countWordsInFile(files[i]);
+                    mergeMaps(localMaps[threadId], fileFrequencies);
+                }
+            }
+            else
+            {
+#pragma omp critical
+                cerr << "[ERROR] OpenMP: invalid thread ID " << threadId << endl;
+            }
         }
     }
 
@@ -340,14 +360,9 @@ int main(int argc, char* argv[])
     vector<int> receiveSizes(size, 0);
 
     MPI_Gather(
-        &localSize,
-        1,
-        MPI_INT,
-        receiveSizes.data(),
-        1,
-        MPI_INT,
-        0,
-        MPI_COMM_WORLD
+        &localSize, 1, MPI_INT,
+        receiveSizes.data(), 1, MPI_INT,
+        0, MPI_COMM_WORLD
     );
 
     vector<int> recvDisplacements(size, 0);
@@ -369,15 +384,9 @@ int main(int argc, char* argv[])
     vector<char> receiveBuffer(totalSize > 0 ? totalSize : 1);
 
     MPI_Gatherv(
-        mapSendBuf.data(),
-        localSize,
-        MPI_CHAR,
-        receiveBuffer.data(),
-        receiveSizes.data(),
-        recvDisplacements.data(),
-        MPI_CHAR,
-        0,
-        MPI_COMM_WORLD
+        mapSendBuf.data(), localSize, MPI_CHAR,
+        receiveBuffer.data(), receiveSizes.data(), recvDisplacements.data(), MPI_CHAR,
+        0, MPI_COMM_WORLD
     );
 
     double mpiEnd = MPI_Wtime();
