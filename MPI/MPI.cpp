@@ -1,4 +1,4 @@
-﻿//#define USE_MPI
+﻿#define USE_MPI
 
 #ifdef USE_MPI
 #include <mpi.h>
@@ -15,8 +15,10 @@
 #include <cctype>
 #include <chrono>
 #include <algorithm>
+#include <filesystem>
 
 using namespace std;
+namespace fs = std::filesystem;
 
 string cleanWord(const string& word)
 {
@@ -32,24 +34,33 @@ string cleanWord(const string& word)
     return result;
 }
 
-unordered_map<string, int> countWordsInFile(const string& filename)
+string readFileToString(const string& filename)
 {
-    unordered_map<string, int> frequencies;
-    ifstream file(filename);
+    ifstream file(filename, ios::in | ios::binary);
 
     if (!file.is_open())
     {
-#pragma omp critical
         cerr << "[ERROR] Cannot open file: " << filename << endl;
-        return frequencies;
+        return "";
     }
 
-    string word;
-    while (file >> word)
+    ostringstream ss;
+    ss << file.rdbuf();
+
+    return ss.str();
+}
+
+unordered_map<string, int> calculateWordFrequencies(const string& content)
+{
+    unordered_map<string, int> frequencies;
+    istringstream stream(content);
+    string token;
+
+    while (stream >> token)
     {
-        string cleaned = cleanWord(word);
-        if (!cleaned.empty())
-            frequencies[cleaned]++;
+        string word = cleanWord(token);
+        if (!word.empty())
+            frequencies[word]++;
     }
 
     return frequencies;
@@ -60,6 +71,48 @@ void mergeMaps(unordered_map<string, int>& globalMap,
 {
     for (const auto& pair : localMap)
         globalMap[pair.first] += pair.second;
+}
+
+void findFilesRecursively(const fs::path& basePath, vector<string>& foundFiles)
+{
+    error_code ec;
+
+    if (!fs::exists(basePath, ec) || ec)
+    {
+        cerr << "[ERROR] Path does not exist: " << basePath
+            << (ec ? " (" + ec.message() + ")" : "") << endl;
+        return;
+    }
+
+    if (fs::is_regular_file(basePath, ec) && !ec)
+    {
+        foundFiles.push_back(basePath.string());
+    }
+    else if (fs::is_directory(basePath, ec) && !ec)
+    {
+        error_code iterEc;
+        try
+        {
+            for (const auto& entry : fs::recursive_directory_iterator(
+                basePath, fs::directory_options::skip_permission_denied, iterEc))
+            {
+                if (iterEc) { iterEc.clear(); continue; }
+
+                error_code typeEc;
+                if (entry.is_regular_file(typeEc) && !typeEc)
+                    foundFiles.push_back(entry.path().string());
+            }
+        }
+        catch (const fs::filesystem_error& e)
+        {
+            cerr << "[ERROR] Filesystem exception: " << e.what() << endl;
+        }
+    }
+    else if (ec)
+    {
+        cerr << "[ERROR] Cannot determine type of path: " << basePath
+            << " (" << ec.message() << ")" << endl;
+    }
 }
 
 void printTopWords(const unordered_map<string, int>& frequencies, int limit = 10)
@@ -92,8 +145,12 @@ unordered_map<string, int> singleThreadWordCount(const vector<string>& files)
 
     for (const string& file : files)
     {
-        auto fileFrequencies = countWordsInFile(file);
-        mergeMaps(globalFrequencies, fileFrequencies);
+        string content = readFileToString(file);
+        if (!content.empty())
+        {
+            auto fileFrequencies = calculateWordFrequencies(content);
+            mergeMaps(globalFrequencies, fileFrequencies);
+        }
     }
 
     return globalFrequencies;
@@ -133,8 +190,12 @@ unordered_map<string, int> openMpWordCount(const vector<string>& files, int thre
 #pragma omp for schedule(dynamic)
                 for (int i = 0; i < (int)files.size(); i++)
                 {
-                    auto fileFrequencies = countWordsInFile(files[i]);
-                    mergeMaps(localMaps[threadId], fileFrequencies);
+                    string content = readFileToString(files[i]);
+                    if (!content.empty())
+                    {
+                        auto fileFrequencies = calculateWordFrequencies(content);
+                        mergeMaps(localMaps[threadId], fileFrequencies);
+                    }
                 }
             }
             else
@@ -228,7 +289,7 @@ int main(int argc, char* argv[])
 
     if (argc < 3)
     {
-        cerr << "Usage: program.exe <threads> file1.txt file2.txt ..." << endl;
+        cerr << "Usage: program.exe <threads> path1 path2 ..." << endl;
         return 1;
     }
 
@@ -236,7 +297,16 @@ int main(int argc, char* argv[])
 
     vector<string> files;
     for (int i = 2; i < argc; i++)
-        files.emplace_back(argv[i]);
+        findFilesRecursively(fs::path(argv[i]), files);
+
+    if (files.empty())
+    {
+        cout << "No files found." << endl;
+        return 0;
+    }
+
+    sort(files.begin(), files.end());
+    cout << "Processing " << files.size() << " files..." << endl;
 
     auto singleStart = chrono::high_resolution_clock::now();
     auto singleResult = singleThreadWordCount(files);
@@ -269,19 +339,43 @@ int main(int argc, char* argv[])
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     vector<string> files;
+    bool filesFound = false;
 
     if (rank == 0)
     {
         if (argc < 2)
         {
-            cerr << "Usage: mpiexec -n <processes> program.exe file1.txt file2.txt ..." << endl;
+            cerr << "Usage: mpiexec -n <processes> program.exe path1 path2 ..." << endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
             return 1;
         }
 
         for (int i = 1; i < argc; i++)
-            files.emplace_back(argv[i]);
+            findFilesRecursively(fs::path(argv[i]), files);
 
+        if (files.empty())
+        {
+            cout << "No files found." << endl;
+            filesFound = false;
+        }
+        else
+        {
+            sort(files.begin(), files.end());
+            filesFound = true;
+        }
+    }
+
+    int flag = filesFound ? 1 : 0;
+    MPI_Bcast(&flag, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (!flag)
+    {
+        MPI_Finalize();
+        return 0;
+    }
+
+    if (rank == 0)
+    {
         auto singleStart = chrono::high_resolution_clock::now();
         auto singleResult = singleThreadWordCount(files);
         auto singleEnd = chrono::high_resolution_clock::now();
@@ -350,8 +444,12 @@ int main(int argc, char* argv[])
 
     for (const string& filename : localFiles)
     {
-        auto fileFrequencies = countWordsInFile(filename);
-        mergeMaps(localFrequencies, fileFrequencies);
+        string content = readFileToString(filename);
+        if (!content.empty())
+        {
+            auto fileFrequencies = calculateWordFrequencies(content);
+            mergeMaps(localFrequencies, fileFrequencies);
+        }
     }
 
     string serializedLocalMap = serializeMap(localFrequencies);
